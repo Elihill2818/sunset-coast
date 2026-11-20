@@ -1,79 +1,102 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Screenshot scenes: each one stages a real moment of the game — a fresh world,
+// a scripted driver, and the same fixed steps the game itself runs. Nothing here
+// is posed by hand: the traffic, the police and the physics all run for real,
+// which is why the frames look alive instead of arranged.
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
+import { STEP } from './config.js';
+import { createCar } from './vehicles.js';
 
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function makePilot(throttle, steer) {
+  return {
+    throttle: () => throttle,
+    steer: () => steer,
+    running: () => false,
+    walkVector: () => ({ x: 0, y: 0 }),
+    actionHeld: () => 0,
+    takeActions: () => 0,
+    takeDigit: () => 0,
+  };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+const IDLE = makePilot(0, 0);
+
+function runSteps(world, pilot, count) {
+  for (let i = 0; i < count; i += 1) world.step(STEP, pilot);
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
 export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+  if (name === 'start') {
+    // Golden hour over Palm Heights: Lena's first job, the red Comet, and the
+    // player pulling away from the kerb. The title sits on top of this.
+    world.timeHours = 17.5;
+    world.missions.start();
+    const car = world.missions.active.data.car;
+    world.player.x = car.x;
+    world.player.y = car.y + 30;
+    world.enterCar();
+    runSteps(world, makePilot(0.55, 0), 200);
+    // Drop the camera so the car sits below the title text, not behind it.
+    world.camera.y -= 170;
+    return { screen: 'title' };
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+
+  if (name === 'drive') {
+    // Full throttle down the coast road at golden hour: beach and sea to the
+    // south, the pier sliding past, traffic to thread.
+    world.timeHours = 17.8;
+    const car = createCar('sport', 560, 2520, 0, '#e2543e', 'parked');
+    world.parkedCars.push(car);
+    world.player.x = 560;
+    world.player.y = 2550;
+    world.enterCar();
+    runSteps(world, makePilot(1, 0), 200);
+    return { screen: 'play' };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'chase') {
+    // Dusk, three stars, the Getaway job: a teal Comet GT running east while
+    // the cruisers close in behind it.
+    world.timeHours = 18.8;
+    world.missions.index = 2;
+    world.missions.start();
+    const car = createCar('sport', 1440, 1440, 0, '#39c0c8', 'parked');
+    world.parkedCars.push(car);
+    world.player.x = 1440;
+    world.player.y = 1470;
+    world.enterCar();
+    // A short run: the cruisers spawn 800 behind and close for 2.5 s, so they
+    // end up right on the player's bumper instead of a screen behind.
+    runSteps(world, makePilot(1, 0), 150);
+    world.dialogue = null;
+    // One more beat so the prompt refreshes (it is computed inside step).
+    runSteps(world, makePilot(1, 0), 2);
+    return { screen: 'play' };
+  }
+
+  if (name === 'mission') {
+    // Night at the impound lot: the Falcon is stolen, three stars are up, and
+    // the player is flooring it out of the gate with the law behind.
+    world.timeHours = 20.5;
+    world.missions.index = 1;
+    world.missions.start();
+    const falcon = world.missions.active.data.car;
+    world.player.x = falcon.x - 40;
+    world.player.y = falcon.y + 40;
+    runSteps(world, IDLE, 3);
+    world.enterCar();
+    runSteps(world, IDLE, 2);
+    // 12 (entering the lot) + 30 (stealing) + 18 = 60 heat, three stars.
+    world.police.addHeat(18);
+    const car = world.playerCar;
+    car.x = 3160;
+    car.angle = -Math.PI / 2;
+    // Just out of the gate — any further north and the Falcon meets a building.
+    runSteps(world, makePilot(1, 0), 70);
+    world.dialogue = null;
+    // One more beat so the prompt refreshes (it is computed inside step).
+    runSteps(world, makePilot(1, 0), 2);
+    return { screen: 'play' };
+  }
+
+  return { screen: 'play' };
 }

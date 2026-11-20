@@ -1,18 +1,21 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
+// Boot and the one loop: input is read once per frame, the world advances in
+// fixed 1/60 s steps, and the renderer paints what is there. Screens: title,
+// play, paused, busted, wasted.
 //
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
+// ?seed=N fixes the city. ?shot=start|drive|chase|mission (with &seed=N) stages
+// that scene instead of running the loop, paints it twice and sets
+// window.__shotReady for a screenshot.
+import { STEP } from './config.js';
 import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+import { createWorld } from './world.js';
+import { ACTION_CONFIRM, ACTION_ENTER, ACTION_MUTE, ACTION_PAUSE, createInput } from './input.js';
+import { createRenderer, SCREEN_BUSTED, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WASTED } from './render.js';
+import { createAudio } from './audio.js';
+import { loadSave } from './save.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
 const MAX_FRAME = 0.25;
+const HINT_SECONDS = 6;
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
@@ -21,104 +24,143 @@ const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() 
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
 const renderer = createRenderer(canvas);
+const audio = createAudio();
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
-  }
+const IDLE_PILOT = {
+  throttle: () => 0,
+  steer: () => 0,
+  running: () => false,
+  walkVector: () => ({ x: 0, y: 0 }),
+  actionHeld: () => 0,
+  takeActions: () => 0,
+  takeDigit: () => 0,
+};
+
+function announce(message) {
+  status.textContent = message;
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
+if (shot) {
+  const world = createWorld(createRandom(seed), null);
+  const scene = stageShot(shot, world);
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(world, scene.screen, { dt: 1 / 60, hintTimer: 0, hasSave: false, saveSummary: '' });
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
   }
   requestAnimationFrame(paint);
+} else {
+  runGame();
 }
 
 function runGame() {
+  const saveData = loadSave();
+  const world = createWorld(createRandom(seed), saveData);
   const input = createInput(canvas);
   let screen = SCREEN_TITLE;
-  let best = readBest();
   let accumulator = 0;
   let last = performance.now();
+  let hintTimer = HINT_SECONDS;
+  let titleDrift = 0;
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
+  const saveSummary = saveData
+    ? `Saved: $${saveData.cash.toLocaleString()}  •  ${saveData.completed.length} job${saveData.completed.length === 1 ? '' : 's'} done  •  $${saveData.earned.toLocaleString()} earned`
+    : '';
 
   function startGame() {
-    world.reset();
-    accumulator = 0;
+    audio.unlock();
     screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
+    accumulator = 0;
+    announce('Playing. Steal a car, take a job from Lena, and own the coast.');
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
+    const dt = Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+
+    // One read per frame: the world gets the same presses through a wrapper
+    // that only answers on the first sub-step, so a single E never fires twice.
+    const actions = input.takeActions();
+    const digit = input.takeDigit();
+    if (actions & ACTION_MUTE) audio.setMuted(!audio.isMuted());
+
+    // Screen-level keys are handled here; the world gets the rest.
+    if (screen === SCREEN_TITLE) {
+      if (actions & (ACTION_CONFIRM | ACTION_ENTER)) startGame();
+    } else if (screen === SCREEN_PLAY) {
+      if (actions & ACTION_PAUSE) {
+        screen = SCREEN_PAUSED;
+        announce('Paused.');
+      }
+    } else if (screen === SCREEN_PAUSED) {
+      if (actions & (ACTION_PAUSE | ACTION_CONFIRM)) {
+        screen = SCREEN_PLAY;
+        announce('Playing.');
+      }
+    }
+
+    let actionsLeft = actions;
+    let digitLeft = digit;
+    const stepInput = {
+      throttle: () => input.throttle(),
+      steer: () => input.steer(),
+      running: () => input.running(),
+      walkVector: () => input.walkVector(),
+      actionHeld: () => input.actionHeld(),
+      takeActions: () => {
+        const taken = actionsLeft;
+        actionsLeft = 0;
+        return taken;
+      },
+      takeDigit: () => {
+        const taken = digitLeft;
+        digitLeft = 0;
+        return taken;
+      },
+    };
+
+    if (screen === SCREEN_TITLE) {
+      // Attract mode: the city lives behind the title, camera drifting.
+      accumulator += dt;
+      while (accumulator >= STEP) {
+        world.step(STEP, IDLE_PILOT);
         accumulator -= STEP;
       }
+      titleDrift += dt;
+      world.camera.x = 720 + Math.sin(titleDrift * 0.08) * 200;
+      world.camera.y = 600 + Math.cos(titleDrift * 0.06) * 140;
+    } else if (screen === SCREEN_PLAY) {
+      accumulator += dt;
+      while (accumulator >= STEP) {
+        world.step(STEP, stepInput);
+        accumulator -= STEP;
+      }
+      hintTimer = Math.max(0, hintTimer - dt);
+      if (world.overlay === 'busted') screen = SCREEN_BUSTED;
+      else if (world.overlay === 'wasted') screen = SCREEN_WASTED;
+    } else if (screen === SCREEN_BUSTED || screen === SCREEN_WASTED) {
+      // The world is frozen until the player acknowledges.
+      world.step(STEP, stepInput);
+      if (!world.overlay) screen = SCREEN_PLAY;
+      accumulator = 0;
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+
+    // Sound effects the world queued this frame, then the engine hum.
+    for (const name of world.fx.sounds) audio.play(name);
+    world.fx.sounds.length = 0;
+    const car = world.playerCar;
+    audio.engine(car ? Math.abs(car.speed) : 0, world.police.stars);
+
+    renderer.draw(world, screen, { dt, hintTimer, hasSave: !!saveData, saveSummary });
   }
 
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
+  // Leaving the tab pauses a running game rather than letting it run unseen.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
@@ -126,9 +168,6 @@ function runGame() {
     }
   });
 
-  announce('Block Dodger. Press Space or click to start.');
+  announce(saveData ? 'Sunset Coast. Press Enter to continue.' : 'Sunset Coast. Press Enter to start.');
   requestAnimationFrame(frame);
 }
-
-if (shot) runShot(shot);
-else runGame();
